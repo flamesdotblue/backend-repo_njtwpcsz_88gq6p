@@ -67,20 +67,58 @@ def test_database():
     return response
 
 
-@app.get("/images")
-def get_images(query: str = Query(..., min_length=1, description="Search prompt"), limit: int = Query(24, ge=1, le=50)) -> Dict[str, Any]:
-    """
-    Search for images related to a prompt using Wikipedia's public API (no key required).
-    Returns a simple list of thumbnails and page links.
-    """
-    # Wikipedia API endpoint for searching pages with thumbnails
+def search_commons_images(query: str, limit: int) -> List[Dict[str, Any]]:
+    """Use Wikimedia Commons to fetch image files directly relevant to the query."""
+    api = "https://commons.wikimedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "origin": "*",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": 6,  # File namespace
+        "gsrlimit": min(limit, 50),
+        "prop": "imageinfo|info",
+        "iiprop": "url|extmetadata",
+        "iiurlwidth": 800,
+        "inprop": "url",
+    }
+    r = requests.get(api, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    pages = data.get("query", {}).get("pages", {})
+    items: List[Dict[str, Any]] = []
+    for pageid, page in pages.items():
+        imageinfo = (page.get("imageinfo") or [{}])[0]
+        thumb = imageinfo.get("thumburl") or imageinfo.get("url")
+        if not thumb:
+            continue
+        title = page.get("title", "")
+        desc_url = page.get("fullurl") or f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}"
+        summary = None
+        extmeta = imageinfo.get("extmetadata") or {}
+        artist = (extmeta.get("Artist") or {}).get("value")
+        if artist:
+            summary = f"By {artist}"
+        items.append({
+            "title": title.replace("File:", "").strip(),
+            "thumbnail": thumb,
+            "pageUrl": desc_url,
+            "summary": summary,
+            "source": "wikimedia_commons"
+        })
+    return items
+
+
+def search_wikipedia_pages(query: str, limit: int) -> List[Dict[str, Any]]:
+    """Fallback: search Wikipedia pages with thumbnails."""
     api_url = "https://en.wikipedia.org/w/api.php"
     params = {
         "action": "query",
         "generator": "search",
         "gsrsearch": query,
         "gsrlimit": min(limit, 50),
-        "prop": "pageimages|extracts",
+        "prop": "pageimages|extracts|info",
         "pilicense": "any",
         "pithumbsize": 600,
         "format": "json",
@@ -88,45 +126,70 @@ def get_images(query: str = Query(..., min_length=1, description="Search prompt"
         "exintro": 1,
         "explaintext": 1,
         "exsentences": 1,
+        "inprop": "url",
     }
+    r = requests.get(api_url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    pages = data.get("query", {}).get("pages", {})
+    items: List[Dict[str, Any]] = []
+    for pageid, page in pages.items():
+        thumb = page.get("thumbnail", {}).get("source")
+        if not thumb:
+            continue
+        title = page.get("title")
+        extract = page.get("extract")
+        fullurl = page.get("fullurl") or f"https://en.wikipedia.org/?curid={pageid}"
+        items.append({
+            "title": title,
+            "thumbnail": thumb,
+            "pageUrl": fullurl,
+            "summary": extract,
+            "source": "wikipedia"
+        })
+    return items
 
+
+@app.get("/images")
+def get_images(query: str = Query(..., min_length=1, description="Search prompt"), limit: int = Query(24, ge=1, le=50)) -> Dict[str, Any]:
+    """
+    Search for images relevant to a prompt using Wikimedia Commons first (direct media),
+    then fall back to Wikipedia page thumbnails. Only if both fail, return placeholders.
+    """
     try:
-        r = requests.get(api_url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        pages = data.get("query", {}).get("pages", {})
-        items: List[Dict[str, Any]] = []
-        for pageid, page in pages.items():
-            thumb = page.get("thumbnail", {}).get("source")
-            title = page.get("title")
-            extract = page.get("extract")
-            if thumb:
-                items.append({
-                    "title": title,
-                    "thumbnail": thumb,
-                    "pageUrl": f"https://en.wikipedia.org/?curid={pageid}",
-                    "summary": extract,
-                    "source": "wikipedia"
-                })
-        # If nothing found, provide a gentle fallback using Picsum placeholders matching the theme
+        # 1) Wikimedia Commons: returns actual image files for the query
+        items = search_commons_images(query, limit)
+
+        # 2) If too few from Commons, top up with Wikipedia thumbnails
+        if len(items) < limit:
+            wiki_items = search_wikipedia_pages(query, limit)
+            # Avoid duplicates by URL
+            seen = {i["thumbnail"] for i in items}
+            for w in wiki_items:
+                if w["thumbnail"] not in seen and len(items) < limit:
+                    items.append(w)
+                    seen.add(w["thumbnail"])
+
+        # 3) Final fallback: high-quality placeholders so the UI still shows something
         if not items:
             items = [
                 {
                     "title": f"Placeholder #{i+1}",
-                    "thumbnail": f"https://picsum.photos/seed/{query}-{i}/600/400",
+                    "thumbnail": f"https://picsum.photos/seed/{query}-{i}/800/600",
                     "pageUrl": "https://picsum.photos/",
                     "summary": "Placeholder image while we find results",
                     "source": "picsum"
                 }
                 for i in range(min(limit, 12))
             ]
+
         return {"query": query, "count": len(items), "items": items}
+
     except Exception as e:
-        # On error, still return an object with a helpful message and safe fallback images
         fallback = [
             {
                 "title": f"Placeholder #{i+1}",
-                "thumbnail": f"https://picsum.photos/seed/{query}-{i}/600/400",
+                "thumbnail": f"https://picsum.photos/seed/{query}-{i}/800/600",
                 "pageUrl": "https://picsum.photos/",
                 "summary": "Placeholder image due to an error fetching results",
                 "source": "picsum"
