@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+import requests
+from typing import List, Dict, Any
 
 app = FastAPI()
 
@@ -63,6 +65,75 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     
     return response
+
+
+@app.get("/images")
+def get_images(query: str = Query(..., min_length=1, description="Search prompt"), limit: int = Query(24, ge=1, le=50)) -> Dict[str, Any]:
+    """
+    Search for images related to a prompt using Wikipedia's public API (no key required).
+    Returns a simple list of thumbnails and page links.
+    """
+    # Wikipedia API endpoint for searching pages with thumbnails
+    api_url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": min(limit, 50),
+        "prop": "pageimages|extracts",
+        "pilicense": "any",
+        "pithumbsize": 600,
+        "format": "json",
+        "origin": "*",
+        "exintro": 1,
+        "explaintext": 1,
+        "exsentences": 1,
+    }
+
+    try:
+        r = requests.get(api_url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        pages = data.get("query", {}).get("pages", {})
+        items: List[Dict[str, Any]] = []
+        for pageid, page in pages.items():
+            thumb = page.get("thumbnail", {}).get("source")
+            title = page.get("title")
+            extract = page.get("extract")
+            if thumb:
+                items.append({
+                    "title": title,
+                    "thumbnail": thumb,
+                    "pageUrl": f"https://en.wikipedia.org/?curid={pageid}",
+                    "summary": extract,
+                    "source": "wikipedia"
+                })
+        # If nothing found, provide a gentle fallback using Picsum placeholders matching the theme
+        if not items:
+            items = [
+                {
+                    "title": f"Placeholder #{i+1}",
+                    "thumbnail": f"https://picsum.photos/seed/{query}-{i}/600/400",
+                    "pageUrl": "https://picsum.photos/",
+                    "summary": "Placeholder image while we find results",
+                    "source": "picsum"
+                }
+                for i in range(min(limit, 12))
+            ]
+        return {"query": query, "count": len(items), "items": items}
+    except Exception as e:
+        # On error, still return an object with a helpful message and safe fallback images
+        fallback = [
+            {
+                "title": f"Placeholder #{i+1}",
+                "thumbnail": f"https://picsum.photos/seed/{query}-{i}/600/400",
+                "pageUrl": "https://picsum.photos/",
+                "summary": "Placeholder image due to an error fetching results",
+                "source": "picsum"
+            }
+            for i in range(6)
+        ]
+        return {"query": query, "count": len(fallback), "items": fallback, "error": str(e)}
 
 
 if __name__ == "__main__":
